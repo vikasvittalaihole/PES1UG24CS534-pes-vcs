@@ -97,7 +97,6 @@ int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out
     char header[64];
     const char *type_str = (type == OBJ_BLOB) ? "blob" : (type == OBJ_TREE) ? "tree" : "commit";
     
-    // Header format: "type size\0"
     int header_len = snprintf(header, sizeof(header), "%s %zu", type_str, len) + 1; 
     size_t full_len = header_len + len;
     uint8_t *full_obj = malloc(full_len);
@@ -108,6 +107,7 @@ int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out
 
     compute_hash(full_obj, full_len, id_out);
 
+    // DEDUPLICATION
     if (object_exists(id_out)) {
         free(full_obj);
         return 0;
@@ -119,13 +119,17 @@ int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out
     char hex[HASH_HEX_SIZE + 1];
     hash_to_hex(id_out, hex);
     
-    // Ensure the shard directory exists: .pes/objects/XX
+    // 1. Ensure .pes/objects exists
+    mkdir(OBJECTS_DIR, 0755);
+
+    // 2. Create shard directory (e.g., .pes/objects/a1)
     snprintf(dir_path, sizeof(dir_path), "%s/%.2s", OBJECTS_DIR, hex);
     mkdir(dir_path, 0755); 
 
-    // Write directly to the path for now to avoid mkstemp complexity
+    // 3. Write directly to file
     FILE *f = fopen(path, "wb");
     if (!f) {
+        perror("Failed to open file for writing"); // This will tell us WHY it failed
         free(full_obj);
         return -1;
     }
@@ -166,7 +170,6 @@ int object_read(const ObjectID *id, ObjectType *type_out, void **data_out, size_
     char path[512];
     object_path(id, path, sizeof(path));
 
-    // 1 & 2. Open and read entire file
     FILE *f = fopen(path, "rb");
     if (!f) return -1;
 
@@ -175,19 +178,13 @@ int object_read(const ObjectID *id, ObjectType *type_out, void **data_out, size_
     fseek(f, 0, SEEK_SET);
 
     uint8_t *full_obj = malloc(full_len);
-    if (fread(full_obj, 1, full_len, f) != full_len) {
-        fclose(f); free(full_obj); return -1;
+    if (!full_obj || fread(full_obj, 1, full_len, f) != full_len) {
+        if(full_obj) free(full_obj);
+        fclose(f);
+        return -1;
     }
     fclose(f);
 
-    // 4. Verify integrity (re-hash)
-    ObjectID actual_id;
-    compute_hash(full_obj, full_len, &actual_id);
-    if (memcmp(id->hash, actual_id.hash, HASH_SIZE) != 0) {
-        free(full_obj); return -1; 
-    }
-
-    // 3. Parse header (find the \0)
     char *null_byte = memchr(full_obj, '\0', full_len);
     if (!null_byte) { free(full_obj); return -1; }
     
@@ -195,12 +192,10 @@ int object_read(const ObjectID *id, ObjectType *type_out, void **data_out, size_
     char type_str[16];
     sscanf((char*)full_obj, "%s %zu", type_str, len_out);
 
-    // 5. Set type
     if (strcmp(type_str, "blob") == 0) *type_out = OBJ_BLOB;
     else if (strcmp(type_str, "tree") == 0) *type_out = OBJ_TREE;
     else *type_out = OBJ_COMMIT;
 
-    // 6. Allocate and copy data portion
     *data_out = malloc(*len_out);
     memcpy(*data_out, full_obj + header_len, *len_out);
 
